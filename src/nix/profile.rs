@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use super::run;
+use super::{run, run_env};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Package {
@@ -83,19 +83,30 @@ pub async fn list() -> Result<Vec<Package>> {
     parse(&out.stdout)
 }
 
-pub async fn install(flake_ref: &str, attr: &str) -> Result<()> {
+async fn profile_run(sub: &str, rest: &[&str], unfree: bool) -> Result<()> {
+    let mut args = vec!["profile", sub];
+    if unfree {
+        args.push("--impure");
+    }
+    args.extend_from_slice(rest);
+    let env: &[(&str, &str)] = if unfree {
+        &[("NIXPKGS_ALLOW_UNFREE", "1")]
+    } else {
+        &[]
+    };
+    run_env(&args, env).await.map(drop)
+}
+
+pub async fn install(flake_ref: &str, attr: &str, unfree: bool) -> Result<()> {
     let target = format!("{flake_ref}#{attr}");
-    run(&["profile", "install", target.as_str()])
-        .await
-        .map(drop)
+    profile_run("install", &[target.as_str()], unfree).await
 }
 
-pub async fn upgrade(name: &str) -> Result<()> {
-    run(&["profile", "upgrade", name]).await.map(drop)
+pub async fn upgrade(name: &str, unfree: bool) -> Result<()> {
+    profile_run("upgrade", &[name], unfree).await
 }
-
-pub async fn upgrade_all() -> Result<()> {
-    run(&["profile", "upgrade", "--all"]).await.map(drop)
+pub async fn upgrade_all(unfree: bool) -> Result<()> {
+    profile_run("upgrade", &["--all"], unfree).await
 }
 
 pub async fn remove(name: &str) -> Result<()> {

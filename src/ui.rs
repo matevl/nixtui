@@ -33,8 +33,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_log(f, app, rows[2]);
     draw_footer(f, app, rows[3]);
 
-    if let Mode::ConfirmRemove(name) = &app.mode {
-        draw_confirm(f, name, area);
+    match &app.mode {
+        Mode::ConfirmRemove(name) => draw_confirm(
+            f,
+            " Remove ",
+            &format!("Remove \"{name}\" from your profile?"),
+            area,
+        ),
+        Mode::ConfirmUnfree(action) => draw_confirm(
+            f,
+            " Unfree package ",
+            &format!(
+                "{} needs an unfree package. Retry allowing it?",
+                action.label()
+            ),
+            area,
+        ),
+        _ => {}
     }
 }
 
@@ -223,6 +238,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("Esc", "done"),
         ],
         (Mode::ConfirmRemove(_), _) => &[("y", "confirm"), ("n", "cancel")],
+        (Mode::ConfirmUnfree(_), _) => &[("y", "allow unfree and retry"), ("n", "cancel")],
         (Mode::Normal, Pane::Installed) => &[
             ("/", "search"),
             ("u", "upgrade"),
@@ -255,13 +271,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_confirm(f: &mut Frame, name: &str, area: Rect) {
-    let rect = centered(area, 52, 5);
+fn draw_confirm(f: &mut Frame, title: &str, question: &str, area: Rect) {
+    let rect = centered(area, 64, 5);
     let block = Block::bordered()
-        .title(" Remove ")
+        .title(title.to_string())
         .border_style(Style::new().fg(Color::Red));
     let text = vec![
-        Line::from(format!("Remove \"{name}\" from your profile?")),
+        Line::from(question.to_string()),
         Line::from(""),
         Line::from(vec![
             Span::styled("y", Style::new().fg(Color::Cyan).bold()),

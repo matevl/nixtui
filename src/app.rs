@@ -1,7 +1,6 @@
 //! Application state and all the logic that mutates it. No drawing in here.
 
 use std::collections::VecDeque;
-use std::future::Future;
 
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -10,7 +9,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{Channel, Config};
 use crate::event::{Event, NixEvent, Tx};
-use crate::nix::{self, profile::Package, search::SearchHit};
+use crate::nix::{self, is_unfree_error, profile::Package, search::SearchHit};
 
 const LOG_CAPACITY: usize = 100;
 
@@ -20,6 +19,46 @@ pub enum Mode {
     /// Keystrokes go to the search bar.
     Search,
     ConfirmRemove(String),
+    /// A command was refused because of an unfree licence; waiting for y/n to retry.
+    ConfirmUnfree(Action),
+}
+
+/// A mutating `nix profile` command, kept as data so it can be run again
+/// (for instance with unfree packages allowed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    Install {
+        flake: String,
+        attr: String,
+        channel: Channel,
+    },
+    Upgrade(String),
+    UpgradeAll,
+    Remove(String),
+}
+
+impl Action {
+    pub fn label(&self) -> String {
+        match self {
+            Action::Install { attr, channel, .. } => {
+                format!("install {attr} ({})", channel.label())
+            }
+            Action::Upgrade(name) => format!("upgrade {name}"),
+            Action::UpgradeAll => "upgrade all".into(),
+            Action::Remove(name) => format!("remove {name}"),
+        }
+    }
+
+    async fn run(self, unfree: bool) -> Result<()> {
+        match self {
+            Action::Install { flake, attr, .. } => {
+                nix::profile::install(&flake, &attr, unfree).await
+            }
+            Action::Upgrade(name) => nix::profile::upgrade(&name, unfree).await,
+            Action::UpgradeAll => nix::profile::upgrade_all(unfree).await,
+            Action::Remove(name) => nix::profile::remove(&name).await,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +109,8 @@ pub struct App {
 
     /// Label of the running mutating command (`nix profile` holds a lock, so one at a time).
     pub busy: Option<String>,
+    /// The running command and whether it already runs with unfree allowed.
+    current: Option<(Action, bool)>,
     pub log: VecDeque<LogEntry>,
     pub spinner: usize,
 }
@@ -93,6 +134,7 @@ impl App {
             search_seq: 0,
             search_task: None,
             busy: None,
+            current: None,
             log: VecDeque::new(),
             spinner: 0,
         }
@@ -151,6 +193,7 @@ impl App {
             Mode::Normal => self.on_key_normal(key),
             Mode::Search => self.on_key_search(key),
             Mode::ConfirmRemove(name) => self.on_key_confirm_remove(key, name),
+            Mode::ConfirmUnfree(action) => self.on_key_confirm_unfree(key, action),
         }
     }
 
@@ -223,9 +266,18 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 self.mode = Mode::Normal;
-                self.spawn_command(format!("remove {name}"), async move {
-                    nix::profile::remove(&name).await
-                });
+                self.start(Action::Remove(name), false);
+            }
+            KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => self.mode = Mode::Normal,
+            _ => {}
+        }
+    }
+
+    fn on_key_confirm_unfree(&mut self, key: KeyEvent, action: Action) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                self.start(action, true);
             }
             KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => self.mode = Mode::Normal,
             _ => {}
@@ -278,13 +330,11 @@ impl App {
         let Some(name) = self.selected_installed().map(|p| p.name.clone()) else {
             return;
         };
-        self.spawn_command(format!("upgrade {name}"), async move {
-            nix::profile::upgrade(&name).await
-        });
+        self.start(Action::Upgrade(name), false);
     }
 
     fn upgrade_all(&mut self) {
-        self.spawn_command("upgrade all".into(), nix::profile::upgrade_all());
+        self.start(Action::UpgradeAll, false);
     }
 
     /// Install the selected result from the active channel, or from the other
@@ -299,26 +349,32 @@ impl App {
             self.channel
         };
         let flake = self.config.flake_ref(channel).to_string();
-        let label = format!("install {attr} ({})", channel.label());
-        self.spawn_command(
-            label,
-            async move { nix::profile::install(&flake, &attr).await },
+        self.start(
+            Action::Install {
+                flake,
+                attr,
+                channel,
+            },
+            false,
         );
     }
 
     /// Run a mutating `nix profile` command in the background.
-    fn spawn_command<F>(&mut self, label: String, fut: F)
-    where
-        F: Future<Output = Result<()>> + Send + 'static,
-    {
+    fn start(&mut self, action: Action, unfree: bool) {
         if let Some(running) = self.busy.clone() {
             self.push_log(Level::Error, format!("busy: `{running}` is still running"));
             return;
         }
+        let label = if unfree {
+            format!("{} (unfree)", action.label())
+        } else {
+            action.label()
+        };
         self.busy = Some(label.clone());
+        self.current = Some((action.clone(), unfree));
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = fut.await;
+            let result = action.run(unfree).await;
             let _ = tx.send(Event::Nix(NixEvent::CommandDone { label, result }));
         });
     }
@@ -382,12 +438,22 @@ impl App {
             }
             NixEvent::CommandDone { label, result } => {
                 self.busy = None;
+                let current = self.current.take();
                 match result {
                     Ok(()) => {
                         self.push_log(Level::Success, format!("✓ {label}"));
                         self.refresh_profile();
                     }
-                    Err(e) => self.push_log(Level::Error, format!("✗ {label}: {e:#}")),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        match current {
+                            // First attempt refused over the licence: ask, then retry.
+                            Some((action, false)) if is_unfree_error(&msg) => {
+                                self.mode = Mode::ConfirmUnfree(action);
+                            }
+                            _ => self.push_log(Level::Error, format!("✗ {label}: {msg}")),
+                        }
+                    }
                 }
             }
         }
